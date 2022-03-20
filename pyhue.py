@@ -1,214 +1,404 @@
-#!/usr/bin/env python3
+import datetime
 import json
-import math
+import os
+from enum import Enum
 
-import click
+import requests as requests
+import urllib3
 
-from main import Hue, DebugMode
+from time import sleep
+from os import path
+from colormath.color_conversions import convert_color
+from colormath.color_objects import sRGBColor, xyYColor
+from requests import Response
+from urllib3.exceptions import InsecureRequestWarning
+from config import full_path
 
-# region setup
-hue = Hue()
-hue.refresh_cache(scheduled_refresh=True)
-hue.debug_mode = DebugMode.CREATE_DEBUG_FILES
-
-
-@click.group()
-def cli():
-    pass
-
-
-# endregion
-
-# region set light state and set room state
-@cli.command('light')
-@click.argument('light_name')
-@click.option('--is-id', is_flag=True, default=False)
-@click.option('--rgb', required=True, help='RGB color values', nargs=3, type=int)  # --rgb 255 0 0
-@click.option('-b', '--brightness', help='Brightness of the light', default=None)
-def control_light(light_name, is_id, rgb, brightness=None):
-    """ Control a single Hue light """
-    click.echo('Working on it...')
-
-    light_id = light_name
-    if not is_id:
-        light = hue.get_light_by_name(name=light_name)
-        if light is None:
-            click.echo(f'Unable to find light with name \'{light_name}\'! Have you refreshed the cache after renaming?')
-            exit()
-        light_id = light['id']
-
-    print(light_id)
-
-    hue.set_light_state(light_id=light_id, rgb=rgb, on_state=True, brightness=brightness)
-    click.echo('Done!')
+urllib3.disable_warnings(category=InsecureRequestWarning)
 
 
-@cli.command('room')
-@click.argument('room_name')
-@click.option('--is-id', is_flag=True, default=False)
-@click.option('--rgb', required=True, help='RGB color values', nargs=3, type=int)  # --rgb 255 0 0
-@click.option('-b', '--brightness', help='Brightness of the light', default=None)
-def control_room(room_name, is_id, rgb, brightness=None):
-    """ Control all the lights in a room """
-    click.echo('Working on it...')
-
-    room_id = room_name
-    if not is_id:
-        room_id = hue.get_light_setup_id_by_name(room_name)
-        if room_id is None:
-            click.echo(f'Unable to find light with name \'{room_name}\'!')
-            exit()
-
-    hue.set_room_light_states(room_id=room_id, rgb=rgb, brightness=brightness)
-    click.echo('Done!')
+class DebugMode(Enum):
+    OFF = 0
+    CREATE_DEBUG_FILES = 1
 
 
-# endregion
+class Hue:
+    bridge_api_url = None
+    bridge_clip_url = None
+    user = None
+    api_key = None
+    api_username = None
+    debug_mode = DebugMode.OFF
+    json_file_dir = full_path + 'data'
 
-# region caching-related commands
-@cli.command('refresh-cache')
-@click.option('-d', '--device', is_flag=True, default=False)
-@click.option('-r', '--rooms', is_flag=True, default=False)
-@click.option('-s', '--scenes', is_flag=True, default=False)
-@click.option('-l', '--lights', is_flag=True, default=False)
-@click.option('-w', '--wipe', is_flag=True, default=False)
-def refresh_cache(device, rooms, scenes, lights, wipe):
-    """ Refresh the existing cache """
+    def __init__(self, ipaddr: str | None = None, auto_connect: bool = True):
+        self.try_load_config()
+        if self.bridge_api_url and self.bridge_clip_url:
+            return
 
-    if not device and not rooms and not rooms:
-        click.echo('Nothing to refresh. Specify what you want to refresh with --rooms, --device and/or --scenes.'
-                   '\n\'pyhue refresh-cache --help\' for more help')
+        if ipaddr is not None:
+            self.bridge_api_url = f'http://{ipaddr}/api'
+            self.bridge_clip_url = f'https://{ipaddr}/clip/v2'
 
-    hue.refresh_cache(refresh_rooms=rooms, refresh_device=device, refresh_scenes=scenes, refresh_lights=lights,
-                      wipe=wipe, log=click.echo)
+            if auto_connect:
+                self.link()
+            self.save_config()
+            return
 
+        res = requests.get('https://discovery.meethue.com')
+        if res.status_code == 200:
+            self.bridge_api_url = f'http://{res.json()[0]["internalipaddress"]}/api'
+            self.bridge_clip_url = f'https://{res.json()[0]["internalipaddress"]}/clip/v2'
 
-# endregion
+            if auto_connect:
+                self.link()
+            self.save_config()
+        else:
+            print('Something went wrong trying to connect to https://discovery.meethue.com!')
 
-# region DEPRECATED SETUP
-@cli.command('add-setup-entry', deprecated=True)
-@click.option('-l', '--for-light', prompt='Is this for a light? (False if it is for a room)', is_flag=True, type=bool)
-@click.option('-n', '--name', prompt='What do you want to name the device?', help='The lamps name')
-@click.option('--rid', prompt='What rid does the device currently have? (You can check with pyhue ls)',
-              help='The lamps rid')
-def add_setup_entry(for_light, name, rid):
-    """ Add an entry to the named setup file """
-    raise DeprecationWarning()
-    # existing_setup = hue.load_light_setup()
-    #
-    # new_setup = {
-    #     'rooms': [],
-    #     'lights': [],
-    # }
-    # if existing_setup is not None:
-    #     new_setup = existing_setup
-    #
-    # for device in new_setup['lights' if for_light else 'rooms']:
-    #     if device['name'].lower() == name.lower():
-    #         print(
-    #             f'Name \'{name}\' is already in use by another device. Consider changing the name or removing the other entry!')
-    #         exit()
-    #
-    # new_setup['lights' if for_light else 'rooms'].append({
-    #     'name': name,
-    #     'rid': rid,
-    # })
-    #
-    # hue.save_light_setup(json.dumps(new_setup))
-    #
-    # click.echo(f'\nAdded device with rid \'{rid}\' and name \'{name}\' successfully!')
+    def link(self, force=False):
+        if not force and self.api_key and self.api_username:
+            return
 
+        if self.bridge_api_url is None or self.bridge_clip_url is None:
+            print('Bridge api client connection failed to initialize properly.')
+            return
 
-@cli.command('remove-setup-entry', deprecated=True)
-@click.option('-l', '--for-light', prompt='Is this for a light? (False if it is for a room)', type=bool)
-@click.option('--rid', prompt='What rid does the device currently have? (You can check with pyhue ls)',
-              help='The lamps rid')
-def remove_setup_entry(for_light, rid):
-    """ Remove an entry from the named setup file """
-    raise DeprecationWarning()
+        req_body = {
+            'devicetype': 'PyHueController#justmedev',
+            'generateclientkey': True,
+        }
+        res = requests.post(self.bridge_api_url, json=req_body).json()[0]
+        if 'error' in res:
+            if res['error']['type'] == 101:
+                print('Press the link button on your Hue bridge and try again.')
+                exit()
 
-    # existing_setup = hue.load_light_setup()
-    # if existing_setup is None:
-    #     click.echo('There was no setup file. Created one for you')
-    #     exit()
-    #
-    # new_setup = existing_setup
-    # del_index: int | None = None
-    #
-    # for (i, device) in enumerate(new_setup['lights' if for_light else 'rooms']):
-    #     if device['rid'] == rid:
-    #         del_index = i
-    #
-    # if del_index is None:
-    #     click.echo(f'Couldn\'t find entry in list for rid \'{rid}\'')
-    #     exit()
-    #
-    # new_setup['lights' if for_light else 'rooms'].pop(del_index)
-    # hue.save_light_setup(json.dumps(new_setup))
-    #
-    # click.echo(f'\nRemoved device with rid \'{rid}\' successfully!')
+        self.api_username = res['success']['username']
+        self.api_key = res['success']['clientkey']
 
+        self.save_config()
+        print('Successfully connected to the Hue bridge.')
 
-# endregion
+    # region CLIP API v2 request and writing responses to a file
+    def write_response_to_file(self, response: Response):
+        if self.debug_mode != DebugMode.CREATE_DEBUG_FILES:
+            return
 
-# region ls and rn commands
-@cli.command('ls')
-@click.option('-l', '--long', help='A more human-readable way of displaying', is_flag=True, default=False)
-@click.option('-t', '--type', help='List with type of device (room/light)', is_flag=True, default=False)
-@click.option('-n', '--names', help='List with names', is_flag=True, default=False)
-@click.option('-i', '--ids/--no-ids', help='List with/without the ids', default=False)
-@click.option('-r', '--rooms', help='List rooms', is_flag=True, default=False)
-@click.option('-L', '--no-lights', help='Do not list the lights', is_flag=True, default=False)
-@click.option('-C', '--no-cache', help='Do not get the info out of the cache', is_flag=True, default=False)
-def list_lights(long, type, names, ids, rooms, no_lights, no_cache):
-    """ List all the lights and or rooms """
-    responses = {
-        'rooms': hue.get_rooms(cached=not no_cache) if rooms else None,
-        'lights': hue.get_lights(cached=not no_cache) if not no_lights else None,
-    }
+        json_str = json.dumps({
+            'req': {
+                'method': response.request.method,
+                'url': response.request.url,
+                'headers': str(response.request.headers),
+                'body': response.request.body,
+            },
+            'res': {
+                'status_code': response.status_code,
+                'url': response.url,
+                'headers': str(response.headers),
+                'body': str(response.content),
+                'cookies': str(response.cookies),
+                'elapsed': str(response.elapsed),
+                'history': str(response.history),
+            }
+        }, indent=2)
 
-    if not long and not names and not ids:
-        ids = True
+        with open(f'{self.json_file_dir}/response_log.json', 'w+') as file:
+            file.write(json_str)
 
-    for key in responses:
-        device_data = responses[key]
-        if device_data is None:
-            continue
+        with open(f'{self.json_file_dir}/raw_response.json', 'w+') as file:
+            try:
+                file.write(json.dumps(response.json()))
+            except TypeError:
+                pass
 
-        for device in device_data:
-            message = ''
-            if type:
-                message += f'{"room " if key == "rooms" else "light"} '
+    def clip_request(self, method: str,
+                     path: str,
+                     data: str | None = None,
+                     headers: dict | None = None,
+                     verify_ssl_cert: bool = False,
+                     api_key_header: bool = True,
+                     log_response_to_file: bool = True):
+        if data is None and method != 'GET':
+            print(f'Method \'{method}\' needs a \'data\' argument!')
+            exit(1)
 
-            message += device['id'] if ids else ''
+        if headers is None:
+            headers = {}
+        if api_key_header:
+            headers['hue-application-key'] = self.api_username
 
-            if names:
-                message += f'{" " if ids else ""}{device["metadata"]["name"]}'
+        response = requests.request(method,
+                                    url=f'{self.bridge_clip_url}{path}',
+                                    headers=headers,
+                                    data=data,
+                                    verify=verify_ssl_cert)
+        if log_response_to_file:
+            self.write_response_to_file(response)
 
-            click.echo(message)
+        return (
+            response,
+            len(response.json()['errors']) > 0 or response.status_code != 200,
+        )
 
+    # endregion
 
-@cli.command('rn', deprecated=True)
-@click.argument('id')
-@click.argument('new_name')
-@click.option('-r', '--room/--light', default=False)
-def rename_light(id, new_name, room):
-    """ Rename a room/light """
-    print('Sorry. At the current state of the v2 API, api clients are not allowed to rename Hue lights/rooms.'
-          ' This might never be a feature.\nInstead, you can do it via the Android/iOS app!')
-    #
-    # if len(new_name) > 32 or len(new_name) <= 1:
-    #     click.echo('New name has to be between 1 and 32 characters!')
-    #     exit()
-    #
-    # if room:
-    #     click.echo('Sorry. This is not implemented yet in the official Hue API that this software uses.')
-    #     exit()
-    #
-    # hue.rename_light_or_room(id, new_name, room)
+    # region Load/Save to config file
+    def try_load_config(self):
+        if not path.exists(f'{self.json_file_dir}/api_config.json'):
+            return
 
+        with open(f'{self.json_file_dir}/api_config.json', 'r') as f:
+            data = json.loads(f.read())
 
-# endregion
+            self.api_username = data['api_username']
+            self.api_key = data['api_key']
+            self.bridge_api_url = data['bridge_api_url']
+            self.bridge_clip_url = data['bridge_clip_url']
+
+    def save_config(self):
+        with open(f'{self.json_file_dir}/api_config.json', 'w+') as f:
+            data = {
+                'api_username': self.api_username,
+                'api_key': self.api_key,
+                'bridge_api_url': self.bridge_api_url,
+                'bridge_clip_url': self.bridge_clip_url,
+            }
+
+            f.write(json.dumps(data))
+
+    def save_light_setup(self, json_str: str):
+        raise DeprecationWarning()
+        # with open(f'{self.json_file_dir}/light_setup.json', 'w+') as file:
+        #     file.write(json_str)
+
+    def load_light_setup(self):
+        raise DeprecationWarning()
+        # if not path.exists(f'{self.json_file_dir}/light_setup.json'):
+        #     return None
+        #
+        # with open(f'{self.json_file_dir}/light_setup.json', 'r') as file:
+        #     return json.loads(file.read())
+
+    def get_light_setup_id_by_name(self, name: str, device_type: str = 'lights'):
+        raise DeprecationWarning()
+        # setup = self.load_light_setup()
+        # for device in setup[device_type]:
+        #     if device['name'].lower() == name.lower():
+        #         return device['rid']
+        #
+        # return None
+
+    # endregion
+
+    # region Caching
+    def refresh_cache(self,
+                      refresh_rooms: bool = False,
+                      refresh_device: bool = False,
+                      refresh_scenes: bool = False,
+                      refresh_lights: bool = False,
+                      wipe: bool = False, log=lambda x: x, scheduled_refresh: bool = True):
+        """
+        Refresh the cache.json file to reflect changes
+        :param refresh_lights: Collect light data
+        :param refresh_rooms: Collect data of all the rooms
+        :param refresh_device: Collect the device specific data
+        :param refresh_scenes: Collect data of all the scenes
+        :param wipe: Delete the existing file and completely rewrite it
+        :param log: Specify a log function (If empty: No log is shown)
+        :param scheduled_refresh: if True, will check last_updated and only update if necessary
+        """
+        file_path = f'{self.json_file_dir}/cache.json'
+        existing_cache = {
+            'last_updated': -1,
+            'device': {},
+            'lights': [],
+            'rooms': [],
+            'scenes': [],
+        }
+
+        if path.exists(file_path):
+            if wipe:
+                log('Deleting/Wiping existing cache...')
+                os.remove(file_path)
+            else:
+                log('Reading existing cache...')
+                with open(file_path, 'r') as file:
+                    existing_cache = json.loads(file.read())
+
+        # 7200 = 3600 * 2 (two hours)
+        if scheduled_refresh and int(datetime.datetime.utcnow().timestamp()) - 7200 >= existing_cache['last_updated']:
+            print('The cache hasn\'t been refreshed in a while. Refreshing it now...\n')
+
+            refresh_device = True
+            refresh_rooms = True
+            refresh_scenes = True
+            refresh_lights = True
+        else:
+            return
+
+        existing_cache['last_updated'] = int(datetime.datetime.utcnow().timestamp())
+
+        if refresh_device:
+            log('Collecting device infos...')
+            device_info = self.get_device_info(cached=False)
+            existing_cache['device'] = device_info[0]
+            sleep(0.2)
+
+        if refresh_lights:
+            log('Collecting light infos')
+            lights = self.get_lights(cached=False)
+            existing_cache['lights'] = lights
+            sleep(0.2)
+
+        if refresh_rooms:
+            log('Collecting room infos')
+            existing_cache['rooms'] = self.get_rooms(cached=False)
+            sleep(0.2)
+
+        if refresh_scenes:
+            log('Collecting scene infos')
+            existing_cache['scenes'] = self.get_scenes(cached=False)
+            sleep(0.2)
+
+        log('Writing results to file...')
+        with open(file_path, 'w+') as file:
+            file.write(json.dumps(existing_cache))
+
+        log('Done')
+
+    def get_from_cache(self, key: str):
+        file_path = f'{self.json_file_dir}/cache.json'
+
+        if path.exists(file_path):
+            with open(file_path, 'r') as file:
+                return json.loads(file.read())[key]
+        return None
+
+    # endregion
+
+    # region GET: Light, rooms, scenes and Device info
+    def get_device_info(self, cached: bool = True):
+        if cached:
+            cached_res = self.get_from_cache('device')
+            if cached_res is not None:
+                return cached_res
+
+        (res, failed) = self.clip_request('GET', '/resource/device')
+        if failed:
+            print('unable to get device info!')
+            return
+
+        return res.json()['data']
+
+    def get_lights(self, cached: bool = True):
+        if cached:
+            cached_res = self.get_from_cache('lights')
+            if cached_res is not None:
+                return cached_res
+
+        (res, failed) = self.clip_request('GET', '/resource/light')
+        if failed:
+            print('Something went wrong trying to get the lights.')
+            return
+
+        return res.json()['data']
+
+    def get_light_by_name(self, name: str, cached: bool = True):
+        lights_res = self.get_lights(cached=cached)
+        for l in lights_res:
+            if l['metadata']['name'].lower() == name.lower():
+                return l
+        return None
+
+    def get_scenes(self, cached: bool = True):
+        if cached:
+            cached_res = self.get_from_cache('scenes')
+            if cached_res is not None:
+                return cached_res
+
+        (res, failed) = self.clip_request('GET', '/resource/scene')
+        if failed:
+            print('Something went wrong trying to get the scenes.')
+            return
+
+        return res.json()['data']
+
+    def get_rooms(self, cached: bool = True):
+        if cached:
+            cached_res = self.get_from_cache('rooms')
+            if cached_res is not None:
+                return cached_res
+
+        (res, failed) = self.clip_request('GET', '/resource/room')
+        if failed:
+            print('Something went wrong trying to get the rooms.')
+            return
+
+        return res.json()['data']
+
+    # endregion
+
+    # region SET: Light, Room light states and rename lights/rooms
+    def set_light_state(self, light_id: str, rgb: tuple[int, int, int], on_state: bool = True,
+                        brightness: int | None = None):
+        (r, g, b) = rgb
+        xyy_color = convert_color(sRGBColor(rgb_r=r, rgb_g=g, rgb_b=b), xyYColor)
+        req_data = {
+            'on': {
+                'on': on_state,
+            },
+            'color': {
+                'xy': {
+                    'x': xyy_color.xyy_x,
+                    'y': xyy_color.xyy_y,
+                },
+            },
+            'dimming': {},
+        }
+
+        print(req_data)
+
+        if brightness is not None:
+            req_data['dimming']['brightness'] = brightness
+
+        (res, failed) = self.clip_request('PUT', f'/resource/light/{light_id}', json.dumps(req_data))
+        if failed:
+            print(f'CLIP Req to set_light_state failed with status {res.status_code}. Is the given rid correct?')
+            return
+
+    def set_room_light_states(self, room_id: str, rgb: tuple[int, int, int], brightness: int | None = None):
+        (res, failed) = self.clip_request('GET', f'/resource/room/{room_id}')
+        if failed:
+            print(f'Something went wrong trying to get information for room {room_id}'
+                  f'while executing set_room_light_states!')
+            return
+
+        for service in res.json()['data'][0]['services']:
+            if service['rtype'] == 'light':
+                self.set_light_state(service['rid'], rgb, True, brightness)
+                sleep(0.2)
+
+    def rename_light_or_room(self, id: str, new_name: str, room: bool = False):
+        print('This doesn\'t seem to work with the Hue API.')
+        if len(new_name) > 32 or len(new_name) <= 1:
+            return None
+
+        data = {
+            'metadata': {
+                'name': new_name
+            }
+        }
+        self.clip_request('PUT', f'/resource/{"room" if room else "light"}/{id}', json.dumps(data))
+    # endregion
+
 
 if __name__ == '__main__':
-    cli()
+    h_hue = Hue()
+    r_lights = h_hue.get_lights()
+
+    for light in r_lights['data']:
+        print(light['metadata']['name'])
+
+    # hue.set_light_state('f3be19b5-aaed-48e1-8c8e-018af99a16c9', 0, 0, 255, True, brightness=50)
+    # hue.set_room_light_states('5dff10b4-d410-44d2-9120-72b8f6fa4ea7', 0, 255, 0)
