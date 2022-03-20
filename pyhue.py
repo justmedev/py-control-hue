@@ -8,8 +8,8 @@ from main import Hue, DebugMode
 
 # region setup
 hue = Hue()
-hue.refresh_cash(scheduled_refresh=True)
-hue.debug_mode = DebugMode.OFF
+hue.refresh_cache(scheduled_refresh=True)
+hue.debug_mode = DebugMode.CREATE_DEBUG_FILES
 
 
 @click.group()
@@ -25,16 +25,19 @@ def cli():
 @click.option('--is-id', is_flag=True, default=False)
 @click.option('--rgb', required=True, help='RGB color values', nargs=3, type=int)  # --rgb 255 0 0
 @click.option('-b', '--brightness', help='Brightness of the light', default=None)
-def light(light_name, is_id, rgb, brightness=None):
+def control_light(light_name, is_id, rgb, brightness=None):
     """ Control a single Hue light """
     click.echo('Working on it...')
 
     light_id = light_name
     if not is_id:
-        light_id = hue.get_light_setup_id_by_name(name=light_name)
-        if light_id is None:
-            click.echo(f'Unable to find light with name \'{light_name}\'!')
+        light = hue.get_light_by_name(name=light_name)
+        if light is None:
+            click.echo(f'Unable to find light with name \'{light_name}\'! Have you refreshed the cache after renaming?')
             exit()
+        light_id = light['id']
+
+    print(light_id)
 
     hue.set_light_state(light_id=light_id, rgb=rgb, on_state=True, brightness=brightness)
     click.echo('Done!')
@@ -45,7 +48,7 @@ def light(light_name, is_id, rgb, brightness=None):
 @click.option('--is-id', is_flag=True, default=False)
 @click.option('--rgb', required=True, help='RGB color values', nargs=3, type=int)  # --rgb 255 0 0
 @click.option('-b', '--brightness', help='Brightness of the light', default=None)
-def room(room_name, is_id, rgb, brightness=None):
+def control_room(room_name, is_id, rgb, brightness=None):
     """ Control all the lights in a room """
     click.echo('Working on it...')
 
@@ -62,20 +65,22 @@ def room(room_name, is_id, rgb, brightness=None):
 
 # endregion
 
-# region cashing-related commands
-@cli.command('refresh-cash')
+# region caching-related commands
+@cli.command('refresh-cache')
 @click.option('-d', '--device', is_flag=True, default=False)
 @click.option('-r', '--rooms', is_flag=True, default=False)
 @click.option('-s', '--scenes', is_flag=True, default=False)
+@click.option('-l', '--lights', is_flag=True, default=False)
 @click.option('-w', '--wipe', is_flag=True, default=False)
-def refresh_cash(device, rooms, scenes, wipe):
-    """ Refresh the existing cash """
+def refresh_cache(device, rooms, scenes, lights, wipe):
+    """ Refresh the existing cache """
 
     if not device and not rooms and not rooms:
         click.echo('Nothing to refresh. Specify what you want to refresh with --rooms, --device and/or --scenes.'
-                   '\n\'pyhue refresh-cash --help\' for more help')
+                   '\n\'pyhue refresh-cache --help\' for more help')
 
-    hue.refresh_cash(refresh_rooms=rooms, refresh_device=device, refresh_scenes=scenes, wipe=wipe, log=click.echo)
+    hue.refresh_cache(refresh_rooms=rooms, refresh_device=device, refresh_scenes=scenes, refresh_lights=lights,
+                      wipe=wipe, log=click.echo)
 
 
 # endregion
@@ -154,11 +159,12 @@ def remove_setup_entry(for_light, rid):
 @click.option('-i', '--ids/--no-ids', help='List with/without the ids', default=False)
 @click.option('-r', '--rooms', help='List rooms', is_flag=True, default=False)
 @click.option('-L', '--no-lights', help='Do not list the lights', is_flag=True, default=False)
-def list_lights(long, type, names, ids, rooms, no_lights):
+@click.option('-C', '--no-cache', help='Do not get the info out of the cache', is_flag=True, default=False)
+def list_lights(long, type, names, ids, rooms, no_lights, no_cache):
     """ List all the lights and or rooms """
     responses = {
-        'rooms': hue.get_rooms() if rooms else None,
-        'lights': hue.get_lights() if not no_lights else None,
+        'rooms': hue.get_rooms(cached=not no_cache) if rooms else None,
+        'lights': hue.get_lights(cached=not no_cache) if not no_lights else None,
     }
 
     if not long and not names and not ids:

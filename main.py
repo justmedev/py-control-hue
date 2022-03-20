@@ -40,6 +40,8 @@ class Hue:
             self.bridge_api_url = f'http://{ipaddr}/api'
             self.bridge_clip_url = f'https://{ipaddr}/clip/v2'
 
+            if auto_connect:
+                self.link()
             self.save_config()
             return
 
@@ -48,12 +50,11 @@ class Hue:
             self.bridge_api_url = f'http://{res.json()[0]["internalipaddress"]}/api'
             self.bridge_clip_url = f'https://{res.json()[0]["internalipaddress"]}/clip/v2'
 
+            if auto_connect:
+                self.link()
             self.save_config()
         else:
             print('Something went wrong trying to connect to https://discovery.meethue.com!')
-
-        if auto_connect:
-            self.link()
 
     def link(self, force=False):
         if not force and self.api_key and self.api_username:
@@ -137,7 +138,7 @@ class Hue:
 
         return (
             response,
-            len(response.json()['errors']) > 0,
+            len(response.json()['errors']) > 0 or response.status_code != 200,
         )
 
     # endregion
@@ -190,20 +191,25 @@ class Hue:
 
     # endregion
 
-    # region Cashing
-    def refresh_cash(self, refresh_rooms: bool = False, refresh_device: bool = False, refresh_scenes: bool = False,
-                     wipe: bool = False, log=lambda x: x, scheduled_refresh: bool = True):
+    # region Caching
+    def refresh_cache(self,
+                      refresh_rooms: bool = False,
+                      refresh_device: bool = False,
+                      refresh_scenes: bool = False,
+                      refresh_lights: bool = False,
+                      wipe: bool = False, log=lambda x: x, scheduled_refresh: bool = True):
         """
-        Refresh the cash.json file to reflect changes
+        Refresh the cache.json file to reflect changes
+        :param refresh_lights: Collect light data
         :param refresh_rooms: Collect data of all the rooms
-        :param refresh_device: Collect the device specific data; Also collects light infos
+        :param refresh_device: Collect the device specific data
         :param refresh_scenes: Collect data of all the scenes
         :param wipe: Delete the existing file and completely rewrite it
         :param log: Specify a log function (If empty: No log is shown)
         :param scheduled_refresh: if True, will check last_updated and only update if necessary
         """
-        file_path = f'{self.json_file_dir}/cash.json'
-        existing_cash = {
+        file_path = f'{self.json_file_dir}/cache.json'
+        existing_cache = {
             'last_updated': -1,
             'device': {},
             'lights': [],
@@ -213,50 +219,56 @@ class Hue:
 
         if path.exists(file_path):
             if wipe:
-                log('Deleting/Wiping existing cash...')
+                log('Deleting/Wiping existing cache...')
                 os.remove(file_path)
             else:
-                log('Reading existing cash...')
+                log('Reading existing cache...')
                 with open(file_path, 'r') as file:
-                    existing_cash = json.loads(file.read())
+                    existing_cache = json.loads(file.read())
 
         # 7200 = 3600 * 2 (two hours)
-        if scheduled_refresh and datetime.datetime.utcnow().timestamp() - 7200 >= existing_cash['last_updated']:
-            print('The cash hasn\'t been refreshed in a while. Refreshing it now...\n')
+        if scheduled_refresh and int(datetime.datetime.utcnow().timestamp()) - 7200 >= existing_cache['last_updated']:
+            print('The cache hasn\'t been refreshed in a while. Refreshing it now...\n')
 
             refresh_device = True
             refresh_rooms = True
             refresh_scenes = True
+            refresh_lights = True
         else:
             return
 
-        existing_cash['last_updated'] = datetime.datetime.utcnow().timestamp()
+        existing_cache['last_updated'] = int(datetime.datetime.utcnow().timestamp())
 
         if refresh_device:
-            log('Collecting device and light infos...')
-            device_info = self.get_device_info(cashed=False)
-            existing_cash['device'] = device_info['data'][0]
-            existing_cash['lights'] = device_info['data'][1:]
+            log('Collecting device infos...')
+            device_info = self.get_device_info(cached=False)
+            existing_cache['device'] = device_info[0]
+            sleep(0.2)
+
+        if refresh_lights:
+            log('Collecting light infos')
+            lights = self.get_lights(cached=False)
+            existing_cache['lights'] = lights
             sleep(0.2)
 
         if refresh_rooms:
             log('Collecting room infos')
-            existing_cash['rooms'] = self.get_rooms(cashed=False)['data']
+            existing_cache['rooms'] = self.get_rooms(cached=False)
             sleep(0.2)
 
         if refresh_scenes:
             log('Collecting scene infos')
-            existing_cash['scenes'] = self.get_scenes(cashed=False)['data']
+            existing_cache['scenes'] = self.get_scenes(cached=False)
             sleep(0.2)
 
         log('Writing results to file...')
         with open(file_path, 'w+') as file:
-            file.write(json.dumps(existing_cash))
+            file.write(json.dumps(existing_cache))
 
         log('Done')
 
-    def get_from_cash(self, key: str):
-        file_path = f'{self.json_file_dir}/cash.json'
+    def get_from_cache(self, key: str):
+        file_path = f'{self.json_file_dir}/cache.json'
 
         if path.exists(file_path):
             with open(file_path, 'r') as file:
@@ -266,11 +278,11 @@ class Hue:
     # endregion
 
     # region GET: Light, rooms, scenes and Device info
-    def get_device_info(self, cashed: bool = True):
-        if cashed:
-            cashed_res = self.get_from_cash('device')
-            if cashed_res is not None:
-                return cashed_res
+    def get_device_info(self, cached: bool = True):
+        if cached:
+            cached_res = self.get_from_cache('device')
+            if cached_res is not None:
+                return cached_res
 
         (res, failed) = self.clip_request('GET', '/resource/device')
         if failed:
@@ -279,11 +291,11 @@ class Hue:
 
         return res.json()['data']
 
-    def get_lights(self, cashed: bool = True):
-        if cashed:
-            cashed_res = self.get_from_cash('lights')
-            if cashed_res is not None:
-                return cashed_res
+    def get_lights(self, cached: bool = True):
+        if cached:
+            cached_res = self.get_from_cache('lights')
+            if cached_res is not None:
+                return cached_res
 
         (res, failed) = self.clip_request('GET', '/resource/light')
         if failed:
@@ -292,11 +304,18 @@ class Hue:
 
         return res.json()['data']
 
-    def get_scenes(self, cashed: bool = True):
-        if cashed:
-            cashed_res = self.get_from_cash('scenes')
-            if cashed_res is not None:
-                return cashed_res
+    def get_light_by_name(self, name: str, cached: bool = True):
+        lights_res = self.get_lights(cached=cached)
+        for l in lights_res:
+            if l['metadata']['name'].lower() == name.lower():
+                return l
+        return None
+
+    def get_scenes(self, cached: bool = True):
+        if cached:
+            cached_res = self.get_from_cache('scenes')
+            if cached_res is not None:
+                return cached_res
 
         (res, failed) = self.clip_request('GET', '/resource/scene')
         if failed:
@@ -305,11 +324,11 @@ class Hue:
 
         return res.json()['data']
 
-    def get_rooms(self, cashed: bool = True):
-        if cashed:
-            cashed_res = self.get_from_cash('rooms')
-            if cashed_res is not None:
-                return cashed_res
+    def get_rooms(self, cached: bool = True):
+        if cached:
+            cached_res = self.get_from_cache('rooms')
+            if cached_res is not None:
+                return cached_res
 
         (res, failed) = self.clip_request('GET', '/resource/room')
         if failed:
@@ -323,8 +342,8 @@ class Hue:
     # region SET: Light, Room light states and rename lights/rooms
     def set_light_state(self, light_id: str, rgb: tuple[int, int, int], on_state: bool = True,
                         brightness: int | None = None):
-        xyy_color = convert_color(sRGBColor(*rgb), xyYColor)
-
+        (r, g, b) = rgb
+        xyy_color = convert_color(sRGBColor(rgb_r=r, rgb_g=g, rgb_b=b), xyYColor)
         req_data = {
             'on': {
                 'on': on_state,
@@ -338,12 +357,14 @@ class Hue:
             'dimming': {},
         }
 
+        print(req_data)
+
         if brightness is not None:
             req_data['dimming']['brightness'] = brightness
 
         (res, failed) = self.clip_request('PUT', f'/resource/light/{light_id}', json.dumps(req_data))
         if failed:
-            print('CLIP Req to set_light_state failed.')
+            print(f'CLIP Req to set_light_state failed with status {res.status_code}. Is the given rid correct?')
             return
 
     def set_room_light_states(self, room_id: str, rgb: tuple[int, int, int], brightness: int | None = None):
@@ -373,10 +394,10 @@ class Hue:
 
 
 if __name__ == '__main__':
-    hue = Hue()
-    lights = hue.get_lights()
+    h_hue = Hue()
+    r_lights = h_hue.get_lights()
 
-    for light in lights['data']:
+    for light in r_lights['data']:
         print(light['metadata']['name'])
 
     # hue.set_light_state('f3be19b5-aaed-48e1-8c8e-018af99a16c9', 0, 0, 255, True, brightness=50)
